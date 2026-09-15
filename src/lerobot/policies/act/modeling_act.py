@@ -23,9 +23,11 @@ import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from pathlib import Path
 
 import einops
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
@@ -33,10 +35,64 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+from lerobot.datasets.compute_stats import compute_relative_action_stats
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+
+
+def compute_state_residual_stats(
+    config: ACTConfig, dataset_stats: dict, dataset_meta
+) -> dict[str, list[float]]:
+    """Compute the statistics used by `predict_state_residual` from the dataset.
+
+    The residual of an action is `action - state`, taken over every action chunk of the dataset (joints matching
+    `config.residual_exclude_joints` are masked out and keep their absolute value). The absolute action/state
+    statistics are the same ones the normalizer uses. Values are returned as plain lists so they can be stored in
+    `config.residual_stats` and saved with the checkpoint.
+    """
+    action_dim = config.action_feature.shape[0]
+    if config.robot_state_feature is None or config.robot_state_feature.shape[0] != action_dim:
+        raise ValueError(
+            "`predict_state_residual` requires an `observation.state` with the same dimension as `action`."
+        )
+
+    data = pd.concat(
+        pd.read_parquet(p, columns=[ACTION, OBS_STATE, "episode_index"])
+        for p in sorted((Path(dataset_meta.root) / "data").glob("*/*.parquet"))
+    )
+    columns = {
+        ACTION: np.stack(data[ACTION].to_numpy()),
+        OBS_STATE: np.stack(data[OBS_STATE].to_numpy()),
+        "episode_index": data["episode_index"].to_numpy(),
+    }
+    residual = compute_relative_action_stats(
+        hf_dataset=columns,
+        features=dataset_meta.features,
+        chunk_size=config.chunk_size,
+        exclude_joints=config.residual_exclude_joints,
+    )
+
+    names = dataset_meta.features[ACTION].get("names") or []
+    excluded = [token.lower() for token in config.residual_exclude_joints]
+    mask = [
+        0.0 if i < len(names) and any(token in str(names[i]).lower() for token in excluded) else 1.0
+        for i in range(action_dim)
+    ]
+
+    def to_list(x) -> list[float]:
+        return np.asarray(x, dtype=np.float32).reshape(-1).tolist()
+
+    return {
+        "action_mean": to_list(dataset_stats[ACTION]["mean"]),
+        "action_std": to_list(dataset_stats[ACTION]["std"]),
+        "state_mean": to_list(dataset_stats[OBS_STATE]["mean"]),
+        "state_std": to_list(dataset_stats[OBS_STATE]["std"]),
+        "residual_mean": to_list(residual["mean"]),
+        "residual_std": to_list(residual["std"]),
+        "mask": mask,
+    }
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -61,6 +117,17 @@ class ACTPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+
+        if config.predict_state_residual and config.residual_stats is None:
+            # `make_policy` passes the dataset metadata when training from scratch; checkpoints carry the stats.
+            dataset_meta = kwargs.get("dataset_meta")
+            if dataset_meta is None:
+                raise ValueError(
+                    "`predict_state_residual=True` requires `residual_stats` in the config or a `dataset_meta`."
+                )
+            config.residual_stats = compute_state_residual_stats(
+                config, kwargs.get("dataset_stats") or dataset_meta.stats, dataset_meta
+            )
 
         self.model = ACT(config)
 
@@ -143,6 +210,9 @@ class ACTPolicy(PreTrainedPolicy):
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
         abs_err = F.l1_loss(batch[ACTION], actions_hat, reduction="none")
+        if self.config.predict_state_residual:
+            # Measure the error in the residual-normalized units the action head predicts in.
+            abs_err = abs_err / self.model.residual_out_scale
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
         num_valid = valid_mask.sum() * abs_err.shape[-1]
         l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
@@ -295,6 +365,27 @@ class ACT(nn.Module):
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
         self.config = config
+
+        if config.predict_state_residual:
+            if config.residual_stats is None:
+                raise ValueError("`predict_state_residual=True` requires `config.residual_stats`.")
+            stats = {k: torch.tensor(v, dtype=torch.float32) for k, v in config.residual_stats.items()}
+            eps = 1e-8  # same eps as the normalizer
+            action_std, state_std = stats["action_std"] + eps, stats["state_std"] + eps
+            mask = stats["mask"]
+            # normalized action = normalized state * residual_state_scale + residual_bias
+            #                     + head output * residual_out_scale        (identity on excluded joints)
+            self.register_buffer("residual_state_scale", mask * state_std / action_std, persistent=False)
+            self.register_buffer(
+                "residual_bias",
+                mask * (stats["state_mean"] + stats["residual_mean"] - stats["action_mean"]) / action_std,
+                persistent=False,
+            )
+            self.register_buffer(
+                "residual_out_scale",
+                torch.where(mask.bool(), (stats["residual_std"] + eps) / action_std, torch.ones_like(mask)),
+                persistent=False,
+            )
 
         if self.config.use_vae:
             self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
@@ -508,6 +599,12 @@ class ACT(nn.Module):
         decoder_out = decoder_out.transpose(0, 1)
 
         actions = self.action_head(decoder_out)
+        if self.config.predict_state_residual:
+            # The head predicts the normalized offset from the current state; map it back to the normalized
+            # absolute action so the policy output (and the loss target) stay absolute.
+            actions = actions * self.residual_out_scale + (
+                batch[OBS_STATE] * self.residual_state_scale + self.residual_bias
+            ).unsqueeze(1)
 
         return actions, (mu, log_sigma_x2)
 

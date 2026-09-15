@@ -147,41 +147,49 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
 ) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
-    """Create train and optional eval datasets by splitting episodes based on eval_split.
+    """Create train and optional eval datasets by splitting episodes.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
-    If eval_split == 0.0, returns (full_dataset, None).
+    If dataset.eval_episodes is set, exactly those episodes are held out for evaluation. Otherwise the
+    last ceil(n_episodes * eval_split) episodes per task are held out.
+    If neither is set, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
 
-    if cfg.dataset.eval_split == 0.0:
+    if cfg.dataset.eval_split == 0.0 and cfg.dataset.eval_episodes is None:
         return full_dataset, None
 
     base_episodes = (
         full_dataset.episodes if full_dataset.episodes is not None else list(range(full_dataset.num_episodes))
     )
 
-    episode_tasks = full_dataset.meta.episodes["tasks"]
-    task_to_episodes: dict[str, list[int]] = {}
-    for ep_idx in base_episodes:
-        task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
-        task_to_episodes.setdefault(task_key, []).append(ep_idx)
+    train_episodes: list[int] = []
+    eval_episodes: list[int] = []
+    if cfg.dataset.eval_episodes is not None:
+        total = full_dataset.meta.total_episodes
+        out_of_range = [ep for ep in cfg.dataset.eval_episodes if ep >= total]
+        if out_of_range:
+            raise ValueError(f"eval_episodes {out_of_range} out of range for dataset with {total} episodes.")
+        held_out = set(cfg.dataset.eval_episodes)
+        eval_episodes = sorted(held_out)
+        train_episodes = [ep for ep in base_episodes if ep not in held_out]
+        split_desc = "explicit eval_episodes"
+    else:
+        episode_tasks = full_dataset.meta.episodes["tasks"]
+        task_to_episodes: dict[str, list[int]] = {}
+        for ep_idx in base_episodes:
+            task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
+            task_to_episodes.setdefault(task_key, []).append(ep_idx)
 
-    train_episodes, eval_episodes = [], []
-    for eps in task_to_episodes.values():
-        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
-        train_episodes.extend(eps[: len(eps) - n_eval])
-        eval_episodes.extend(eps[len(eps) - n_eval :])
+        for eps in task_to_episodes.values():
+            n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
+            train_episodes.extend(eps[: len(eps) - n_eval])
+            eval_episodes.extend(eps[len(eps) - n_eval :])
+        split_desc = f"eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks"
 
     if not train_episodes:
-        raise ValueError(
-            f"eval_split={cfg.dataset.eval_split} leaves 0 training episodes from {len(base_episodes)} total."
-        )
+        raise ValueError(f"The eval hold-out ({split_desc}) leaves 0 training episodes from {len(base_episodes)} total.")
 
-    logging.info(
-        f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval "
-        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
-    )
+    logging.info(f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval ({split_desc})")
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta)
 

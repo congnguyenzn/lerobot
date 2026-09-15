@@ -49,6 +49,8 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Explicit episode indices held out for offline evaluation. Mutually exclusive with eval_split.
+    eval_episodes: list[int] | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
@@ -67,6 +69,15 @@ class DatasetConfig:
             )
         if not (0.0 <= self.eval_split < 1.0):
             raise ValueError(f"eval_split must be in [0.0, 1.0), got {self.eval_split}")
+        if self.eval_episodes is not None:
+            if self.eval_split != 0.0:
+                raise ValueError("Set either eval_split or eval_episodes, not both.")
+            if self.repo_type == "bucket":
+                raise ValueError("eval_episodes requires map-style datasets and is not supported with repo_type='bucket'.")
+            if not self.eval_episodes:
+                raise ValueError("eval_episodes must not be empty.")
+            if any(ep < 0 for ep in self.eval_episodes) or len(self.eval_episodes) != len(set(self.eval_episodes)):
+                raise ValueError(f"eval_episodes must be unique non-negative indices, got: {self.eval_episodes}")
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

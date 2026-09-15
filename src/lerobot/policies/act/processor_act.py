@@ -18,9 +18,11 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    ImageCropResizeProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
-    make_default_pre_post_processors,
+    make_default_policy_processor_steps,
+    make_policy_processor_pipelines,
 )
 
 from .configuration_act import ACTConfig
@@ -47,4 +49,11 @@ def make_act_pre_post_processors(
         tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
         pre-processor pipeline and the post-processor pipeline.
     """
-    return make_default_pre_post_processors(config, dataset_stats, normalizer_device=config.device)
+    s = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=config.device)
+    input_steps = [s.rename_observations, s.add_batch_dim, s.to_device]
+    if config.resize_shape is not None:
+        # Resize after moving to device (fast on GPU) and before normalization (per-channel stats are
+        # resolution independent).
+        input_steps.append(ImageCropResizeProcessorStep(resize_size=tuple(config.resize_shape)))
+    input_steps.append(s.normalize)
+    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=[s.unnormalize, s.to_cpu])

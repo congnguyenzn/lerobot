@@ -82,8 +82,8 @@ class ACTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 100
-    n_action_steps: int = 100
+    chunk_size: int = 50
+    n_action_steps: int = 15
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -98,13 +98,16 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # (H, W) to resize every camera image to in the preprocessor (saved with the checkpoint, so it is
+    # applied identically at inference). None keeps the native resolution.
+    resize_shape: tuple[int, int] | None = None
     # Transformer layers.
     pre_norm: bool = False
-    dim_model: int = 512
+    dim_model: int = 384
     n_heads: int = 8
-    dim_feedforward: int = 3200
+    dim_feedforward: int = 1024
     feedforward_activation: str = "relu"
-    n_encoder_layers: int = 4
+    n_encoder_layers: int = 2
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
@@ -113,6 +116,14 @@ class ACTConfig(PreTrainedConfig):
     use_vae: bool = True
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
+    # State-residual action head. The action head predicts each action's offset from the current state
+    # (normalized with the statistics of that offset) instead of the absolute action, and the model adds the
+    # state back, so the policy still outputs absolute actions and the processors/action queue are unchanged.
+    # Joints matching `residual_exclude_joints` (e.g. the gripper) stay absolute.
+    predict_state_residual: bool = False
+    residual_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Computed from the training dataset when the policy is created, then saved with the config.
+    residual_stats: dict[str, list[float]] | None = None
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
@@ -149,6 +160,10 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.resize_shape is not None and (
+            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
+        ):
+            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
