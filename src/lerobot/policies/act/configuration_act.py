@@ -119,9 +119,11 @@ class ACTConfig(PreTrainedConfig):
     # State-residual action head. The action head predicts each action's offset from the current state
     # (normalized with the statistics of that offset) instead of the absolute action, and the model adds the
     # state back, so the policy still outputs absolute actions and the processors/action queue are unchanged.
-    # Joints matching `residual_exclude_joints` (e.g. the gripper) stay absolute.
+    # Joints matching `residual_exclude_joints` (e.g. the gripper) stay absolute, as do the action dimensions
+    # listed in `residual_exclude_dims` (for datasets whose `action` feature has no `names`).
     predict_state_residual: bool = False
     residual_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    residual_exclude_dims: list[int] | None = None
     # Computed from the training dataset when the policy is created, then saved with the config.
     residual_stats: dict[str, list[float]] | None = None
 
@@ -131,6 +133,10 @@ class ACTConfig(PreTrainedConfig):
 
     # Training and loss computation.
     dropout: float = 0.1
+    # Std of the Gaussian noise added (training only) to the normalized `observation.state` fed to the
+    # encoders, so the policy leans less on the exact proprioception. The state-residual base keeps the
+    # clean state.
+    state_noise_std: float = 0.0
     kl_weight: float = 10.0
 
     # Training preset

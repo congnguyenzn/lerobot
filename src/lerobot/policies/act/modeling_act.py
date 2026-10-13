@@ -48,9 +48,9 @@ def compute_state_residual_stats(
     """Compute the statistics used by `predict_state_residual` from the dataset.
 
     The residual of an action is `action - state`, taken over every action chunk of the dataset (joints matching
-    `config.residual_exclude_joints` are masked out and keep their absolute value). The absolute action/state
-    statistics are the same ones the normalizer uses. Values are returned as plain lists so they can be stored in
-    `config.residual_stats` and saved with the checkpoint.
+    `config.residual_exclude_joints` and the dimensions in `config.residual_exclude_dims` are masked out and keep
+    their absolute value). The absolute action/state statistics are the same ones the normalizer uses. Values are
+    returned as plain lists so they can be stored in `config.residual_stats` and saved with the checkpoint.
     """
     action_dim = config.action_feature.shape[0]
     if config.robot_state_feature is None or config.robot_state_feature.shape[0] != action_dim:
@@ -76,8 +76,16 @@ def compute_state_residual_stats(
 
     names = dataset_meta.features[ACTION].get("names") or []
     excluded = [token.lower() for token in config.residual_exclude_joints]
+    excluded_dims = set(config.residual_exclude_dims or [])
+    if any(not 0 <= d < action_dim for d in excluded_dims):
+        raise ValueError(
+            f"`residual_exclude_dims` {sorted(excluded_dims)} out of range for action dim {action_dim}."
+        )
     mask = [
-        0.0 if i < len(names) and any(token in str(names[i]).lower() for token in excluded) else 1.0
+        0.0
+        if i in excluded_dims
+        or (i < len(names) and any(token in str(names[i]).lower() for token in excluded))
+        else 1.0
         for i in range(action_dim)
     ]
 
@@ -494,6 +502,11 @@ class ACT(nn.Module):
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
+        # State fed to the encoders (noised during training); the residual base below uses the clean state.
+        state_in = batch.get(OBS_STATE)
+        if self.training and self.config.state_noise_std > 0 and state_in is not None:
+            state_in = state_in + torch.randn_like(state_in) * self.config.state_noise_std
+
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
@@ -501,7 +514,7 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(state_in)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -553,7 +566,7 @@ class ACT(nn.Module):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(state_in))
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
